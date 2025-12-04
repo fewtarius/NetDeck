@@ -1,0 +1,15 @@
+{
+  "name": "NetDeck",
+  "author": "Fewtarius",
+  "flags": [
+    "_root"
+  ],
+  "publish": {
+    "discord_id": ""
+  },
+  "tags": [
+    "network",
+    "utilities"
+  ],
+  "version": "1.0.25"
+}
