@@ -40,7 +40,6 @@ jobs:
         run: |
           pnpm install --frozen-lockfile
           pnpm run build
-        continue-on-error: true
 
       - name: Download Decky Plugin CLI
         run: |

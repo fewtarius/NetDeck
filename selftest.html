@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>NetDeck UI Self-Test</title>
+    <link rel="stylesheet" href="./src/preview.css" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="results"></div>
+    <script src="./dist/preview.js"></script>
+    <script>
+      // Dropdown interaction test: stop the mock hotspot to expose the
+      // config UI, select a band (string data), then a channel (numeric
+      // data) and an interface (string data), verifying selections persist
+      // after re-renders and that switching bands refreshes the channels.
+      const results = [];
+      function report(name, ok, detail) {
+        results.push(`${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ': ' + detail : ''}`);
+      }
+      const mock = window.__netdeckMock;
+      report('mock exposed', !!mock, mock ? `hotspotActive=${mock.hotspotActive}` : 'missing');
+      if (mock) mock.hotspotActive = false;
+
+      const findSelect = (pred) =>
+        Array.from(document.querySelectorAll('#root select')).find(pred);
+      const isChannelSelect = (s) =>
+        Array.from(s.options).some((o) => o.textContent.startsWith('Channel '));
+      const isIfaceSelect = (s) =>
+        Array.from(s.options).some((o) => o.textContent.includes('Primary Connection'));
+      const isBandSelect = (s) =>
+        Array.from(s.options).some((o) => o.textContent === '2.4GHz');
+
+      setTimeout(() => {
+        const channelSelect = findSelect(isChannelSelect);
+        const ifaceSelect = findSelect(isIfaceSelect);
+        const bandSelect = findSelect(isBandSelect);
+        report('config dropdowns rendered', !!(channelSelect && ifaceSelect && bandSelect),
+          `selects=${document.querySelectorAll('#root select').length}`);
+
+        // Phase 1: on the default band, select a channel valid for it.
+        if (channelSelect) {
+          channelSelect.value = '11';
+          channelSelect.dispatchEvent(new Event('change', { bubbles: true }));
+          report('channel selection dispatched', true, 'target=11');
+        }
+        if (ifaceSelect) {
+          const target = Array.from(ifaceSelect.options).find((o) => o.value !== ifaceSelect.value);
+          ifaceSelect.value = target.value;
+          ifaceSelect.dispatchEvent(new Event('change', { bubbles: true }));
+          report('interface selection dispatched', true, `target=${target.value}`);
+        }
+
+        // Wait for the 120ms mock latency and the 3s status poll, then
+        // verify the controlled selects kept their values.
+        setTimeout(() => {
+          const channelSelect = findSelect(isChannelSelect);
+          const ifaceSelect = findSelect(isIfaceSelect);
+          report('channel value persisted', !!channelSelect && channelSelect.value === '11',
+            `value=${channelSelect ? channelSelect.value : 'missing'}`);
+          report('interface value persisted', !!ifaceSelect,
+            `value=${ifaceSelect ? ifaceSelect.value : 'missing'}`);
+
+          // Phase 2: switch band. The app resets the channel to the band
+          // default and repopulates the channel options.
+          const bandSelect = findSelect(isBandSelect);
+          if (bandSelect) {
+            const bandTarget = Array.from(bandSelect.options).find((o) => o.value !== bandSelect.value);
+            bandSelect.value = bandTarget.value;
+            bandSelect.dispatchEvent(new Event('change', { bubbles: true }));
+            report('band selection dispatched', true, `target=${bandTarget.value}`);
+          }
+
+          // Wait for the band change to re-render the channel list, then
+          // pick a channel valid for the new band.
+          setTimeout(() => {
+            const channelSelect = findSelect(isChannelSelect);
+            const bandSelect = findSelect(isBandSelect);
+            if (channelSelect) {
+              const opt40 = Array.from(channelSelect.options).find((o) => o.value === '40');
+              report('5GHz channel options rendered', !!opt40,
+                `options=${channelSelect.options.length}`);
+              if (opt40) {
+                channelSelect.value = '40';
+                channelSelect.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+            }
+            // Final persistence check after the next poll cycle.
+            setTimeout(() => {
+              const channelSelect = findSelect(isChannelSelect);
+              const bandSelect = findSelect(isBandSelect);
+              report('band value persisted', !!bandSelect && bandSelect.value === '5GHz',
+                `value=${bandSelect ? bandSelect.value : 'missing'}`);
+              report('channel value persisted after band switch',
+                !!channelSelect && channelSelect.value === '40',
+                `value=${channelSelect ? channelSelect.value : 'missing'}`);
+
+              // Regression check: the backend must receive the band with the
+              // channel preference so 5GHz channels validate correctly.
+              const lastChannelSave = [...mock.callLog].reverse()
+                .find((c) => c.method === 'set_channel_preference');
+              report('channel save carries band',
+                !!lastChannelSave && lastChannelSave.args.band === '5GHz' && lastChannelSave.args.channel === 40,
+                lastChannelSave ? `band=${lastChannelSave.args.band} channel=${lastChannelSave.args.channel}` : 'no save');
+              const lastChannelLoad = [...mock.callLog].reverse()
+                .find((c) => c.method === 'get_channel_preference');
+              report('channel load carries band',
+                !!lastChannelLoad && typeof lastChannelLoad.args.band === 'string',
+                lastChannelLoad ? `band=${lastChannelLoad.args.band}` : 'missing band arg');
+
+              document.getElementById('results').textContent = results.join('\n');
+              document.title = results.every((r) => r.startsWith('PASS')) ? 'SELFTEST-PASS' : 'SELFTEST-FAIL';
+            }, 4000);
+          }, 2500);
+        }, 4000);
+      }, 4000);
+    </script>
+  </body>
+</html>

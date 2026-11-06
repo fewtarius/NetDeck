@@ -1,11 +1,13 @@
 {
   "name": "netdeck",
-  "version": "1.0.25",
+  "version": "1.0.30",
   "description": "Network management plugin for SteamOS/handheld devices",
   "scripts": {
     "build": "shx rm -rf dist && rollup -c",
     "watch": "rollup -c -w",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build:preview": "rollup -c rollup.config.preview.js",
+    "preview": "npm run build:preview && python3 -m http.server 8080"
   },
   "keywords": [
     "decky",
@@ -26,7 +28,9 @@
     "@rollup/plugin-replace": "^4.0.0",
     "@rollup/plugin-typescript": "^8.3.3",
     "@types/react": "16.14.0",
-    "@types/react-dom": "16.9.14",
+    "@types/react-dom": "^18.3.7",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
     "rollup": "^2.75.6",
     "rollup-plugin-import-assets": "^1.1.1",
     "shx": "^0.3.4",

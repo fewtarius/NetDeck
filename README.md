@@ -139,7 +139,7 @@ After installation, verify NetDeck is working:
 ### Internet Sharing Setup
 
 1. **Enable NAT Bridging**: Toggle internet sharing in NetDeck interface
-2. **Automatic Routing**: NetDeck configures iptables rules automatically
+2. **Automatic Routing**: NetDeck configures nftables NAT rules and runs an integrated DHCP/DNS server automatically (no external packages required)
 3. **Client Access**: Connected devices receive internet through your primary connection
 4. **Monitoring**: View connected clients in real-time
 
@@ -175,7 +175,7 @@ After installation, verify NetDeck is working:
 - **NetworkManager**: Check if NetworkManager is managing all interfaces
 
 #### No Internet Through Hotspot
-- **NAT configuration**: Verify iptables rules are applied correctly
+- **NAT configuration**: Verify nftables rules are applied correctly
 - **Primary connection**: Ensure primary adapter maintains internet access
 - **Routing**: Check IP forwarding is enabled (`sysctl net.ipv4.ip_forward`)
 
@@ -193,9 +193,8 @@ ip addr show
 # Monitor network traffic
 tcpdump -i wlan1
 
-# Check iptables rules
-iptables -t nat -L
-iptables -L FORWARD
+# Check NAT rules
+nft list table ip netdeck
 ```
 
 ### Log Analysis

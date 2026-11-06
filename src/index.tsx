@@ -101,8 +101,8 @@ const NetDeck: React.FC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
 
   // Create band options using the same pattern
   const bandOptions = [
-    { data: "2.4GHz", label: "2.4ghz" },
-    { data: "5GHz", label: "5ghz" }
+    { data: "2.4GHz", label: "2.4GHz" },
+    { data: "5GHz", label: "5GHz" }
   ];
   
   const hasMultipleWifiAdapters = availableInterfaces.filter(iface => 
@@ -169,8 +169,9 @@ const NetDeck: React.FC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
           }));
         }
 
-        // Load channel preference with band-appropriate defaults
-        const channelResult = await serverAPI.callPluginMethod("get_channel_preference", {});
+        // Load channel preference for the active band so the value exists
+        // in that band's channel pool.
+        const channelResult = await serverAPI.callPluginMethod("get_channel_preference", { band: currentBand });
         let channelToUse = currentBand === "2.4GHz" ? 6 : 36; // Default for band
         if (channelResult.success && channelResult.result) {
           const savedChannel = (channelResult.result as any).channel;
@@ -312,18 +313,18 @@ const NetDeck: React.FC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
       // Save band preference to backend
       const result = await serverAPI.callPluginMethod("set_band_preference", { band });
       if (result.success) {
-        setState(prev => ({ 
-          ...prev, 
-          bandPreference: band,
-          adhocConfig: { ...prev.adhocConfig, band: band }
-        }));
-        
         // Reset channel to default for the selected band
         const defaultChannel = band === "2.4GHz" ? 6 : 36;
         setState(prev => ({ 
           ...prev, 
-          adhocConfig: { ...prev.adhocConfig, channel: defaultChannel }
+          bandPreference: band,
+          adhocConfig: { ...prev.adhocConfig, band: band, channel: defaultChannel }
         }));
+        // Persist the default channel for the new band
+        await serverAPI.callPluginMethod("set_channel_preference", {
+          channel: defaultChannel,
+          band: band
+        });
       }
     } catch (error) {
       console.error("NetDeck: Failed to save band preference:", error);
@@ -374,8 +375,12 @@ const NetDeck: React.FC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
         adhocConfig: { ...prev.adhocConfig, channel: newChannel }
       }));
       
-      // Save to backend immediately
-      await serverAPI.callPluginMethod("set_channel_preference", { channel: newChannel });
+      // Save to backend immediately, tagged with the active band so
+      // validation runs against the correct channel pool.
+      await serverAPI.callPluginMethod("set_channel_preference", {
+        channel: newChannel,
+        band: state.adhocConfig.band
+      });
       console.log(`NetDeck: Channel preference saved: ${newChannel}`);
     } catch (error) {
       console.error("NetDeck: Failed to save channel preference:", error);
