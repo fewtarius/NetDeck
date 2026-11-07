@@ -20,13 +20,13 @@ import shutil
 import ssl
 import sys
 import tempfile
+import time
 import urllib.request
 import zipfile
 from typing import Any, Dict, List, Optional, Tuple
 
 # Make py_modules importable when bundled by Decky
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "py_modules"))
-from netstack import DhcpServer, DnsForwarder  # noqa: E402
 
 CONFIG_DIR = os.path.expanduser("~/.config/netdeck")
 os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -185,8 +185,23 @@ class CommandRunner:
     @staticmethod
     async def run(argv: List[str], timeout: int = 30) -> Dict[str, Any]:
         try:
+            # The backend runs as the unprivileged `deck` user; network
+            # tools (nmcli, nft, sysctl, firewall-cmd) need root.  The deck
+            # user has passwordless sudo on SteamOS.
+            argv = list(argv)
+            if os.geteuid() != 0:
+                argv = ["sudo", "-n"] + argv
+            # PyInstaller's onefile runtime puts its extraction dir in
+            # LD_LIBRARY_PATH; child processes inherit it and resolve
+            # bundled libraries (e.g. libtinfo) that may not match the
+            # system glibc, breaking every spawned tool.  Child tools
+            # must link against the system libraries.
+            env = os.environ.copy()
+            env.pop("LD_LIBRARY_PATH", None)
+            env.pop("LD_PRELOAD", None)
             proc = await asyncio.create_subprocess_exec(
                 *argv,
+                env=env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE)
             try:
@@ -357,7 +372,8 @@ class NftBackend:
 
     async def apply(self) -> Dict[str, Any]:
         ruleset = self._ruleset()
-        # nft --check with stdin isn't directly supported; use temp file
+        # CommandRunner handles sudo + clean env; keep everything in a
+        # temp file since nft reads rulesets from files or stdin.
         tmp = os.path.join(CONFIG_DIR, "netdeck.nft")
         with open(tmp, "w") as fh:
             fh.write(ruleset)
@@ -366,16 +382,12 @@ class NftBackend:
             os.unlink(tmp)
             return {"success": False,
                     "error": f"nft check failed: {check['stderr']}"}
+        applied = await CommandRunner.run(["nft", "--file", tmp])
         os.unlink(tmp)
-        proc = await asyncio.create_subprocess_exec(
-            "nft", "-f", "-",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE)
-        out, err = await proc.communicate(ruleset.encode())
-        if proc.returncode == 0:
-            return {"success": True}
-        return {"success": False, "error": err.decode(errors="replace").strip()}
+        if not applied["success"]:
+            return {"success": False,
+                    "error": f"nft apply failed: {applied['stderr']}"}
+        return {"success": True}
 
     async def delete(self) -> Dict[str, Any]:
         r = await CommandRunner.run(["nft", "delete", "table", "ip", NFT_TABLE])
@@ -394,6 +406,7 @@ class NftBackend:
 
 class FirewalldHelper:
     ZONE = "netdeck"
+    POLICY = "netdeck-forward"
 
     def _available(self) -> bool:
         return shutil.which("firewall-cmd") is not None
@@ -402,7 +415,9 @@ class FirewalldHelper:
         if not self._available():
             return {"success": True, "skipped": "firewalld not installed"}
         r = await CommandRunner.run(["firewall-cmd", "--new-zone", self.ZONE, "--permanent"])
-        if not r["success"] and "already exists" not in r["stderr"]:
+        # NAME_CONFLICT means the zone already exists from an earlier run.
+        if not r["success"] and not any(s in r["stderr"] for s in
+                                        ("already exists", "NAME_CONFLICT")):
             return {"success": False, "error": f"new-zone failed: {r['stderr']}"}
         for svc in ("dhcp", "dns"):
             r = await CommandRunner.run(
@@ -423,6 +438,37 @@ class FirewalldHelper:
         r = await CommandRunner.run(["firewall-cmd", "--reload"])
         if not r["success"]:
             return {"success": False, "error": f"reload failed: {r['stderr']}"}
+        pol = await self._provision_policy()
+        if not pol.get("success"):
+            return pol
+        r = await CommandRunner.run(["firewall-cmd", "--reload"])
+        if not r["success"]:
+            return {"success": False, "error": f"reload failed: {r['stderr']}"}
+        return {"success": True}
+
+    async def _provision_policy(self) -> Dict[str, Any]:
+        """Create a firewalld policy allowing forwarded traffic out of the
+        netdeck zone.  Without this, firewalld's zone-pair reject rule
+        blocks wlan1 -> wlan0 forwarding even though our nft table accepts
+        it (accept in one base chain does not bypass later base chains).
+        """
+        r = await CommandRunner.run(
+            ["firewall-cmd", "--permanent", "--new-policy", self.POLICY])
+        if not r["success"] and not any(s in r["stderr"] for s in
+                                        ("already exists", "NAME_CONFLICT")):
+            return {"success": False, "error": f"new-policy failed: {r['stderr']}"}
+        for arg in (("--add-ingress-zone", self.ZONE),
+                    ("--add-egress-zone", "ANY")):
+            r = await CommandRunner.run(
+                ["firewall-cmd", "--permanent", "--policy", self.POLICY, arg[0], arg[1]])
+            if not r["success"] and "ALREADY_ENABLED" not in r["stderr"] \
+                    and "already" not in r["stderr"]:
+                return {"success": False, "error": f"policy {arg[0]} failed: {r['stderr']}"}
+        r = await CommandRunner.run(
+            ["firewall-cmd", "--permanent", "--policy", self.POLICY,
+             "--set-target", "ACCEPT"])
+        if not r["success"] and "ALREADY_SET" not in r["stderr"]:
+            return {"success": False, "error": f"policy set-target failed: {r['stderr']}"}
         return {"success": True}
 
     async def cleanup(self, ap_iface: str) -> Dict[str, Any]:
@@ -430,6 +476,8 @@ class FirewalldHelper:
             return {"success": True, "skipped": "firewalld not installed"}
         await CommandRunner.run(
             ["firewall-cmd", "--zone", self.ZONE, "--permanent", "--remove-interface", ap_iface])
+        await CommandRunner.run(
+            ["firewall-cmd", "--permanent", "--delete-policy", self.POLICY])
         r = await CommandRunner.run(["firewall-cmd", "--delete-zone", self.ZONE, "--permanent"])
         if not r["success"] and "not found" not in r["stderr"] and "NO_DEFAULT" not in r["stderr"]:
             return {"success": False, "error": f"delete-zone failed: {r['stderr']}"}
@@ -448,10 +496,10 @@ class NetDeckPlugin:
         self.original_mac: Dict[str, str] = {}
         self.hotspot_active = False
         self.hotspot_config: Dict[str, Any] = {}
-        self.dhcp_server: Optional[DhcpServer] = None
-        self.dns_forwarder: Optional[DnsForwarder] = None
+        self._netstack_proc: Optional[asyncio.subprocess.Process] = None
         self._lock = asyncio.Lock()
         self._ip_forward_was = 0
+        self._bridge_cache: Tuple[float, bool] = (0.0, False)
 
         creds = self._load_credentials()
         self.adhoc_config = {
@@ -490,6 +538,50 @@ class NetDeckPlugin:
             if current and current.lower() != desired.lower():
                 decky.logger.info(f"Re-applying saved MAC for {iface}: {desired}")
                 await self.set_mac_address(iface, desired, save_config=True)
+        # Delete orphaned AP profiles left behind by previous sessions.
+        await self._cleanup_orphaned_ap_profiles()
+        # Kill any stale DHCP/DNS helper left over from a previous plugin
+        # instance; it holds privileged ports the new instance needs.
+        r = await CommandRunner.run(
+            ["pkill", "-f", "netstack_runner.py"])
+        if r["success"]:
+            decky.logger.info("Killed stale netstack helper from previous session")
+        try:
+            os.unlink(self._netstack_state_path())
+        except OSError:
+            pass
+        await CommandRunner.run(["nft", "delete", "table", "ip", NFT_TABLE])
+
+    async def _cleanup_orphaned_ap_profiles(self) -> None:
+        """Delete stale WiFi AP profiles and legacy netdeck-* profiles.
+
+        The Python-side DHCP/DNS services do not survive a plugin restart,
+        so any AP-mode profile that is active when the plugin starts is
+        orphaned: clients could join it but would receive no address.
+        NetworkManager profiles that are not in AP mode (client
+        connections such as the user's home WiFi) are left untouched.
+        """
+        r = await CommandRunner.run(
+            ["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"])
+        if not r["success"]:
+            return
+        for line in r["stdout"].splitlines():
+            if ":" not in line:
+                continue
+            name, ctype = line.split(":", 1)
+            if ctype != "802-11-wireless":
+                continue
+            mode = None
+            m = await CommandRunner.run(
+                ["nmcli", "-t", "-f", "802-11-wireless.mode",
+                 "connection", "show", name])
+            if m["success"] and m["stdout"]:
+                mode = m["stdout"].strip().split(":", 1)[-1].strip()
+            if mode == "ap" or name.startswith("netdeck-"):
+                decky.logger.info(
+                    f"Cleaning up orphaned/legacy AP profile: {name}")
+                await CommandRunner.run(["nmcli", "connection", "down", name])
+                await CommandRunner.run(["nmcli", "connection", "delete", name])
 
     def _load_credentials(self) -> Dict[str, str]:
         path = os.path.join(CONFIG_DIR, "preferences.json")
@@ -617,12 +709,15 @@ class NetDeckPlugin:
                             (password, validate_password), (band, validate_band)]:
                 v = fn(val)
                 if not v["success"]:
+                    decky.logger.error(f"Hotspot start rejected: {v['error']}")
                     return v
             v = validate_channel(channel, band)
             if not v["success"]:
+                decky.logger.error(f"Hotspot start rejected: {v['error']}")
                 return v
             v = validate_subnet(subnet)
             if not v["success"]:
+                decky.logger.error(f"Hotspot start rejected: {v['error']}")
                 return v
             net: ipaddress.IPv4Network = v["network"]
             ap_ip = str(net.network_address + 1)
@@ -632,12 +727,15 @@ class NetDeckPlugin:
 
             primary = await get_gateway_interface()
             if not primary:
+                decky.logger.error("Hotspot start rejected: no gateway interface")
                 return {"success": False, "error": "No internet-connected interface found"}
             if interface == primary:
+                decky.logger.error(f"Hotspot start rejected: {interface} is primary")
                 return {"success": False,
                         "error": f"{interface} is the primary connection; use a different interface"}
 
             if not await validate_connectivity():
+                decky.logger.error("Hotspot start rejected: no connectivity on primary")
                 return {"success": False, "error": "Primary interface has no connectivity"}
 
             # Create AP profile
@@ -647,6 +745,7 @@ class NetDeckPlugin:
                 "nmcli", "connection", "add", "type", "wifi",
                 "ifname", interface, "con-name", conn_name, "ssid", ssid])
             if not r["success"]:
+                decky.logger.error(f"Hotspot start failed: create connection: {r['stderr']}")
                 return {"success": False, "error": f"Failed to create connection: {r['stderr']}"}
 
             await CommandRunner.run(["nmcli", "connection", "modify", conn_name,
@@ -677,28 +776,41 @@ class NetDeckPlugin:
             up = await CommandRunner.run(["nmcli", "connection", "up", conn_name])
             if not up["success"]:
                 await CommandRunner.run(["nmcli", "connection", "delete", conn_name])
+                decky.logger.error(f"Hotspot start failed: activate AP: {up['stderr']}")
                 return {"success": False, "error": f"Failed to activate AP: {up['stderr']}"}
             await asyncio.sleep(1)
 
             if not await validate_connectivity():
                 await CommandRunner.run(["nmcli", "connection", "down", conn_name])
                 await CommandRunner.run(["nmcli", "connection", "delete", conn_name])
+                decky.logger.error("Hotspot start failed: primary connectivity lost, rolled back")
                 return {"success": False,
                         "error": "Primary connectivity lost after AP activation; rolled back"}
 
-            # Start DHCP + DNS
-            self.dhcp_server = DhcpServer(interface, ap_ip, str(net.netmask))
-            await self.dhcp_server.start()
-            self.dns_forwarder = DnsForwarder()
-            await self.dns_forwarder.start()
+            # Start DHCP + DNS as a root subprocess (privileged ports)
+            ns = await self._start_netstack(interface, ap_ip, str(net.netmask))
+            if not ns["success"]:
+                await CommandRunner.run(["nmcli", "connection", "down", conn_name])
+                await CommandRunner.run(["nmcli", "connection", "delete", conn_name])
+                decky.logger.error(f"Hotspot start failed: {ns['error']}")
+                return ns
 
             # nftables NAT + packet normalization
             fw = FirewalldHelper()
-            await fw.provision(interface)
+            fwr = await fw.provision(interface)
+            if not fwr.get("success"):
+                await self._rollback_hotspot(conn_name)
+                decky.logger.error(
+                    f"Hotspot start failed: firewalld: {fwr.get('error')}")
+                return fwr
             try:
                 nft = NftBackend(primary, interface, subnet)
-                await nft.apply()
+                nft_r = await nft.apply()
             except ValueError as e:
+                nft_r = {"success": False, "error": str(e)}
+            if not nft_r.get("success"):
+                await self._rollback_hotspot(conn_name)
+                decky.logger.error(f"Hotspot start failed: nft backend: {e}")
                 return {"success": False, "error": str(e)}
 
             # Enable IP forwarding
@@ -736,12 +848,7 @@ class NetDeckPlugin:
                 pass  # Config may have empty strings after partial start
             fw = FirewalldHelper()
             await fw.cleanup(cfg.get("ap_interface", ""))
-            if self.dhcp_server:
-                self.dhcp_server.stop()
-                self.dhcp_server = None
-            if self.dns_forwarder:
-                self.dns_forwarder.stop()
-                self.dns_forwarder = None
+            await self._stop_netstack()
             await CommandRunner.run(["sysctl", "-w",
                                      f"net.ipv4.ip_forward={self._ip_forward_was}"])
             await CommandRunner.run(["nmcli", "connection", "down",
@@ -758,16 +865,82 @@ class NetDeckPlugin:
         prefs["hotspot_autostart"] = cfg
         self._save_preferences(prefs)
 
+    def _netstack_state_path(self) -> str:
+        return os.path.join(CONFIG_DIR, "netstack_state.json")
+
+    def _netstack_runner_path(self) -> Optional[str]:
+        base = os.environ.get("DECKY_PLUGIN_DIR") or os.path.dirname(
+            os.path.abspath(__file__))
+        runner = os.path.join(base, "netstack_runner.py")
+        if os.path.exists(runner):
+            return runner
+        return None
+
+    async def _start_netstack(self, interface: str, ap_ip: str,
+                              netmask: str) -> Dict[str, Any]:
+        """Start DHCP/DNS as a root subprocess.
+
+        The backend runs as the unprivileged `deck` user and cannot bind
+        privileged ports; the helper runs them with root privileges and
+        publishes leases to a state file.
+        """
+        runner = self._netstack_runner_path()
+        if not runner:
+            return {"success": False, "error": "netstack_runner.py not found"}
+        state = self._netstack_state_path()
+        try:
+            os.unlink(state)
+        except OSError:
+            pass
+        self._netstack_proc = await asyncio.create_subprocess_exec(
+            "sudo", "-n", "/usr/bin/python3", runner,
+            "--interface", interface, "--gateway", ap_ip, "--mask", netmask,
+            "--state", state,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE)
+        for _ in range(20):
+            await asyncio.sleep(0.25)
+            if self._netstack_proc.returncode is not None:
+                _, err = await self._netstack_proc.communicate()
+                decky.logger.error(
+                    f"netstack exited: {err.decode(errors='replace').strip()}")
+                return {"success": False, "error": "DHCP/DNS helper failed to start"}
+            if os.path.exists(state):
+                return {"success": True}
+        return {"success": False, "error": "DHCP/DNS helper did not become ready"}
+
+    async def _stop_netstack(self) -> None:
+        proc = self._netstack_proc
+        if proc is None or proc.returncode is not None:
+            self._netstack_proc = None
+            return
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+        self._netstack_proc = None
+
+    async def _rollback_hotspot(self, conn_name: str) -> None:
+        await self._stop_netstack()
+        await CommandRunner.run(["nmcli", "connection", "down", conn_name])
+        await CommandRunner.run(["nmcli", "connection", "delete", conn_name])
+
     async def get_adhoc_status(self) -> Dict[str, Any]:
         return {"active": self.hotspot_active, "config": self.hotspot_config}
 
     # --- DHCP leases ------------------------------------------------
 
     async def get_dhcp_leases(self) -> Dict[str, Any]:
-        if not self.dhcp_server:
+        path = self._netstack_state_path()
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
             return {"leases": [], "count": 0}
-        leases = [{"mac": l.mac, "ip": l.ip, "hostname": l.hostname}
-                  for l in self.dhcp_server.leases.values() if l.active()]
+        now = time.time()
+        leases = [l for l in data.get("leases", []) if l.get("expires", 0) > now]
         return {"leases": leases, "count": len(leases)}
 
     # --- connected clients ------------------------------------------
@@ -784,10 +957,14 @@ class NetDeckPlugin:
             return []
         # Build a MAC->hostname map from DHCP leases for enrichment
         lease_map: Dict[str, str] = {}
-        if self.dhcp_server:
-            for lease in self.dhcp_server.leases.values():
-                if lease.active() and lease.hostname:
-                    lease_map[lease.mac.lower()] = lease.hostname
+        try:
+            with open(self._netstack_state_path()) as fh:
+                now = time.time()
+                for lease in json.load(fh).get("leases", []):
+                    if lease.get("expires", 0) > now and lease.get("hostname"):
+                        lease_map[str(lease.get("mac", "")).lower()] = lease["hostname"]
+        except (OSError, json.JSONDecodeError):
+            pass
         clients = []
         for line in r["stdout"].splitlines():
             parts = line.split()
@@ -826,9 +1003,16 @@ class NetDeckPlugin:
         if gateway:
             mac = await get_current_mac(gateway)
         # bridge_active reflects actual NAT state (nftables table presence),
-        # not just the user's nat_forwarding preference.
-        r = await CommandRunner.run(["nft", "list", "table", "ip", NFT_TABLE])
-        bridge_active = r["success"]
+        # not just the user's nat_forwarding preference.  Cached briefly to
+        # avoid hammering sudo on every status poll.
+        now = time.time()
+        cached_ts, cached_val = self._bridge_cache
+        if now - cached_ts < 10:
+            bridge_active = cached_val
+        else:
+            r = await CommandRunner.run(["nft", "list", "table", "ip", NFT_TABLE])
+            bridge_active = r["success"]
+            self._bridge_cache = (now, bridge_active)
         return {
             # Current frontend schema
             "connectivity": connected,

@@ -37,10 +37,12 @@ interface NetworkStatus {
     channel: number;
     interface: string | null;
     ap_interface?: string;
+    primary_interface?: string | null;
     subnet?: string;
     band?: string;
   };
   bridge_active: boolean;
+  gateway_interface: string | null;
 }
 
 interface ConnectedClient {
@@ -94,9 +96,12 @@ const NetDeck: React.FC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
 
   const wifiInterfaceOptions = availableInterfaces
     .filter(ifaceName => ifaceName.startsWith('wlan'))
+    // The primary (internet) connection cannot serve as the hotspot AP -
+    // the backend rejects it, so don't offer it.
+    .filter(ifaceName => ifaceName !== state.networkStatus?.gateway_interface)
     .map(ifaceName => ({
       data: ifaceName,
-      label: `${ifaceName} (Primary Connection)`
+      label: `${ifaceName} (${state.networkStatus?.interfaces[ifaceName]?.state || 'Unknown'})`
     }));
 
   // Create band options using the same pattern
@@ -519,7 +524,13 @@ const NetDeck: React.FC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
         }
       );
 
-      if (result.success) {
+      const inner = result.result as any;
+      if (inner && inner.success === false) {
+        setState(prev => ({ 
+          ...prev, 
+          error: inner.error || "Failed to set MAC address" 
+        }));
+      } else if (result.success) {
         setState(prev => ({ 
           ...prev, 
           newMacAddress: "",
@@ -552,10 +563,11 @@ const NetDeck: React.FC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
         { interface: state.selectedInterface }
       );
 
-      if (!result.success) {
+      const inner = result.result as any;
+      if (!result.success || (inner && inner.success === false)) {
         setState(prev => ({ 
           ...prev, 
-          error: "Failed to restore original MAC address" 
+          error: (inner && inner.error) || "Failed to restore original MAC address" 
         }));
       }
     } catch (error) {
@@ -584,10 +596,11 @@ const NetDeck: React.FC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
         }
       );
 
-      if (!result.success) {
+      const inner = result.result as any;
+      if (!result.success || (inner && inner.success === false)) {
         setState(prev => ({ 
           ...prev, 
-          error: "Failed to start adhoc network" 
+          error: (inner && inner.error) || "Failed to start adhoc network" 
         }));
       }
     } catch (error) {
@@ -605,10 +618,11 @@ const NetDeck: React.FC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
 
     try {
       const result = await serverAPI.callPluginMethod("stop_adhoc_network", {});
-      if (!result.success) {
+      const inner = result.result as any;
+      if (!result.success || (inner && inner.success === false)) {
         setState(prev => ({ 
           ...prev, 
-          error: "Failed to stop adhoc network" 
+          error: (inner && inner.error) || "Failed to stop adhoc network" 
         }));
       }
     } catch (error) {
@@ -831,14 +845,14 @@ const NetDeck: React.FC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
           React.createElement("div", null,
             React.createElement(PanelSectionRow, null,
               React.createElement(DropdownItem, {
-                label: "Primary Interface",
-                menuLabel: "Select Primary Interface",
+                label: "Hotspot Interface",
+                menuLabel: "Select Hotspot Interface",
                 selectedOption: wifiInterfaceOptions.find((opt: any) => opt.data === state.adhocConfig.interface)?.data,
                 rgOptions: wifiInterfaceOptions,
                 onChange: (option: any) => {
-                  console.log("NetDeck: Primary interface dropdown onChange, selected:", option.data);
+                  console.log("NetDeck: Hotspot interface dropdown onChange, selected:", option.data);
                   if (option.data !== state.adhocConfig.interface) {
-                    console.log("NetDeck: Setting new primary interface:", option.data);
+                    console.log("NetDeck: Setting new hotspot interface:", option.data);
                     handleAdhocInterfaceChange(option.data);
                   }
                 }
@@ -966,13 +980,17 @@ const NetDeck: React.FC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
 
             React.createElement(PanelSectionRow, null,
               React.createElement(Field, { label: "Primary Interface" },
-                React.createElement("span", null, state.networkStatus.adhoc_config.interface)
+                React.createElement("span", null,
+                  state.networkStatus.adhoc_config.primary_interface ||
+                  state.networkStatus.gateway_interface || "unknown")
               )
             ),
 
             React.createElement(PanelSectionRow, null,
               React.createElement(Field, { label: "Hotspot Interface" },
-                React.createElement("span", null, state.networkStatus.adhoc_config.ap_interface)
+                React.createElement("span", null,
+                  state.networkStatus.adhoc_config.ap_interface ||
+                  state.networkStatus.adhoc_config.interface || "unknown")
               )
             ),
 

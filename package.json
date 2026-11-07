@@ -1,6 +1,6 @@
 {
   "name": "netdeck",
-  "version": "1.0.30",
+  "version": "1.0.31",
   "description": "Network management plugin for SteamOS/handheld devices",
   "scripts": {
     "build": "shx rm -rf dist && rollup -c",

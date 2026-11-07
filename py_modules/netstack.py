@@ -88,6 +88,8 @@ class DhcpServer(asyncio.DatagramProtocol):
                             self.interface.encode("ascii") + b"\0")
         except OSError as e:
             logger.warning("SO_BINDTODEVICE failed on %s: %s", self.interface, e)
+        # Required to send replies to 255.255.255.255; without it sendto raises EACCES
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         try:
             sock.bind(("0.0.0.0", 67))
         except OSError as e:
@@ -111,6 +113,7 @@ class DhcpServer(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data: bytes, addr: Tuple[str, int]) -> None:
+        logger.debug("DHCP packet from %s (%d bytes)", addr, len(data))
         try:
             self._process(data)
         except Exception:
@@ -129,7 +132,8 @@ class DhcpServer(asyncio.DatagramProtocol):
         mac = ":".join(f"{b:02x}" for b in chaddr[:hw_len])
         options = self._parse_options(data[240:])
 
-        msg_type = options.get(OPT_DHCP_MSG)
+        msg_type_opt = options.get(OPT_DHCP_MSG)
+        msg_type = msg_type_opt[0] if msg_type_opt else None
         if msg_type in (DHCP_DISCOVER, DHCP_REQUEST):
             self._serve(xid, chaddr[:hw_len], mac, msg_type, options)
         elif msg_type == DHCP_RELEASE:
@@ -237,7 +241,14 @@ class DhcpServer(asyncio.DatagramProtocol):
         packet += opts
 
         if self.transport:
-            self.transport.sendto(bytes(packet), ("<broadcast>", 68))
+            try:
+                self.transport.sendto(bytes(packet), ("<broadcast>", 68))
+                logger.debug("Sent %s to %02x:%02x:%02x:%02x:%02x:%02x (xid=%08x)",
+                             "OFFER" if msg_type == DHCP_OFFER else
+                             "ACK" if msg_type == DHCP_ACK else "NAK",
+                             *hwaddr[:6], xid)
+            except OSError as e:
+                logger.error("Failed to send DHCP reply: %s", e)
 
 
 class DnsForwarder(asyncio.DatagramProtocol):
@@ -301,31 +312,41 @@ class DnsForwarder(asyncio.DatagramProtocol):
     async def _ensure_upstream(self) -> None:
         if self._upstream_transport is None:
             loop = asyncio.get_running_loop()
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._upstream_protocol = _UpstreamProtocol(self)
+            # asyncio refuses remote_addr together with a pre-made socket;
+            # let it create and connect the upstream socket itself.
             self._upstream_transport, _ = await loop.create_datagram_endpoint(
-                lambda: self._upstream_protocol, sock=sock,
+                lambda: self._upstream_protocol,
                 remote_addr=(self.upstream, 53))
 
     def datagram_received(self, data: bytes, addr: Tuple[str, int]) -> None:
+        logger.debug("DNS query from %s (%d bytes, qid=%s)",
+                     addr, len(data), data[0:2].hex() if len(data) >= 2 else "?")
         try:
             asyncio.get_running_loop().create_task(self._relay(data, addr))
         except Exception:
             logger.exception("DNS relay error")
 
     async def _relay(self, data: bytes, addr: Tuple[str, int]) -> None:
-        if len(data) < 12:
-            return
-        await self._ensure_upstream()
-        qid = data[0:2]
-        self._pending[qid] = (addr, time.time())
-        # Prune stale entries
-        now = time.time()
-        stale = [k for k, (_, t) in self._pending.items() if now - t > 15]
-        for k in stale:
-            del self._pending[k]
-        if self._upstream_transport:
-            self._upstream_transport.sendto(data)
+        try:
+            if len(data) < 12:
+                return
+            await self._ensure_upstream()
+            qid = data[0:2]
+            self._pending[qid] = (addr, time.time())
+            # Prune stale entries
+            now = time.time()
+            stale = [k for k, (_, t) in self._pending.items() if now - t > 15]
+            for k in stale:
+                del self._pending[k]
+            if self._upstream_transport:
+                self._upstream_transport.sendto(data)
+                logger.debug("DNS relayed qid=%s to upstream %s",
+                             qid.hex(), self.upstream)
+            else:
+                logger.error("DNS upstream transport missing; dropping query")
+        except Exception:
+            logger.exception("DNS relay task failed")
 
     def error_received(self, exc: Exception) -> None:
         logger.debug("DNS forwarder error: %s", exc)
@@ -346,6 +367,8 @@ class _UpstreamProtocol(asyncio.DatagramProtocol):
         self.forwarder._upstream_transport = transport
 
     def datagram_received(self, data: bytes, addr: Tuple[str, int]) -> None:
+        logger.debug("DNS upstream reply (%d bytes, qid=%s)",
+                     len(data), data[0:2].hex() if len(data) >= 2 else "?")
         try:
             route_reply_for(self.forwarder, data)
         except Exception:
